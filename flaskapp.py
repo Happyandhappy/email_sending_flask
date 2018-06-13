@@ -22,7 +22,7 @@ from werkzeug import secure_filename
 from flask_cors import CORS
 import io
 import time
-
+import shutil
 
 
 path = os.path.dirname(__file__)
@@ -32,27 +32,33 @@ app = Flask(__name__)
 CORS(app)
 
 def getfilenamebyId(service, file_id):
-  try:
-    file = service.files().get(fileId=file_id).execute()
-    return file['name']
-  except :
-    pass
-    return ""
+    try:
+        file = service.files().get(fileId=file_id).execute()
+        if file['mimeType']=='application/vnd.google-apps.folder':
+            return ""
+        else:
+            return file['title']
+    except :
+        pass
+        return ""
 
 def download(service, fileIds, prefix):
     fileNames = []
     for id in fileIds:
-        name = prefix + "/" + getfilenamebyId(service , id)
-        fileNames.append(name)
-        req = service.files().get_media(fileId=id)
-        fh = io.FileIO(name, 'w')
-        downloader = MediaIoBaseDownload(fh, req)
-        done = False
-        try:
-            while done is False:
-                status, done = downloader.next_chunk()
-        except Exception as inst:
-            return "Failed in downloading html file. please check fileId again"
+        result = getfilenamebyId(service , id)
+        if result != "":
+            name = prefix + "/" + getfilenamebyId(service , id)
+            fileNames.append(name)
+            req = service.files().get_media(fileId=id)
+            fh = io.FileIO(name, 'w')
+            downloader = MediaIoBaseDownload(fh, req)
+            done = False
+            try:
+                while done is False:
+                    status, done = downloader.next_chunk()
+            except Exception as inst:
+                return "Failed in downloading html file. please check fileId again"
+    fh.close()
     return fileNames
 
 class EmailTemplate():
@@ -145,17 +151,44 @@ def getConnection():
         flow = client.flow_from_clientsecrets(path + '/client_secret.json', SCOPES)
         creds = tools.run_flow(flow, store)
 
-    service = build('drive', 'v3', http=creds.authorize(Http()))
+    service = build('drive', 'v2', http=creds.authorize(Http()))
     return service
+
+def get_files_in_folder(service, folder_id):
+  """Print files belonging to a folder.
+
+  Args:
+    service: Drive API service instance.
+    folder_id: ID of the folder to print files from.
+  """
+  page_token = None
+  file_ids =[]
+  while True:
+    try:
+      param = {}
+      if page_token:
+        param['pageToken'] = page_token
+      children = service.children().list(
+              folderId=folder_id, **param).execute()
+
+      for child in children.get('items', []):
+          file_ids.append(child['id'])
+      page_token = children.get('nextPageToken')
+      if not page_token:
+        break
+    except errors.HttpError as error:
+      print ('An error occurred: %s' % error)
+      break
+  return file_ids
+
 
 @app.route('/')
 def hello_world():
     return render_template('index.html')
 
-@app.route('/sendEmail', methods=['POST'])
+@app.route('/restApi', methods=['POST'])
 def sendEmail():
     if request.method == 'POST':
-
         ##############  Get params from request ###############
         ##   reply_to   :  destination email
         ##   file_id    :  email file id of google drive  %% You can get file id using this end point "ec2-18-216-179-182.us-east-2.compute.amazonaws.com/fileList"
@@ -176,10 +209,11 @@ def sendEmail():
         else:
             return json.dumps({"error": "Failed! Missing parameter 'msg[To]'"})
 
-        if 'googleattachment' in request.form:
-            googleattachment = request.form['googleattachment']
-        else:
-            return json.dumps({"error": "Failed! Missing parameter 'googleattachment'"})
+        templateID_folder = ""
+        if 'templateID_folder' in request.form:
+            templateID_folder = request.form['templateID_folder']
+        elif 'attachFiles' not in request.files:
+            return json.dumps({"error": "Failed! Missing parameter 'templateID_folder'"})
 
         if 'address' in request.form:
             address = request.form['address']
@@ -196,10 +230,11 @@ def sendEmail():
         else:
             return json.dumps({"error": "Failed! Missing parameter 'name'"})
 
+        templateID = ""
         if 'templateID' in request.form:
             templateID = request.form['templateID']
-        else:
-            return json.dumps({"error": "Failed! Missing parameter 'templateID'"})
+        elif 'template' not in request.files:
+                return json.dumps({"error": "No template found!"})
 
         if 'subject' in request.form:
             subject = request.form['subject']
@@ -209,27 +244,44 @@ def sendEmail():
         prefix = path + "/uploads/" + str(int(round(time.time() * 1000)))
         if not os.path.exists(prefix):
             os.makedirs(prefix)
+            os.makedirs(prefix + "/attachments")
 
-        templateFileName = prefix + "/email.html"
+        if 'template' in request.files:
+            uploadfile = request.files.getlist("template")
+            for file in uploadfile:
+                templateFileName = os.path.join(prefix + "/",secure_filename(file.filename))
+                file.save(templateFileName)
+
+        attachFileNames = []
+        if 'attachFiles' in request.files:
+            uploadsFiles = request.files.getlist("attachFiles")
+            for file in uploadsFiles:
+                fileName = os.path.join(prefix + "/", secure_filename(file.filename))
+                attachFileNames.append(fileName)
+                file.save(fileName)
 
         ## get instance of connection for google drive
         service = getConnection()
-        ## download file which id is file_id and save as "email.html"
-        req = service.files().get_media(fileId=templateID)
-        fh = io.FileIO(templateFileName, 'w')
-        downloader = MediaIoBaseDownload(fh, req)
 
-        done = False
-        try:
-            while done is False:
-                status, done = downloader.next_chunk()
-        except Exception as inst:
-            return json.dumps({"error": "Failed in downloading html file. please check fileId again"})
-        fh.close()
+        if templateID != "":
+            templateFileName = prefix + "/email.html"
+            ## download file which id is file_id and save as "email.html"
+            req = service.files().get_media(fileId=templateID)
+            fh = io.FileIO(templateFileName, 'w')
+            downloader = MediaIoBaseDownload(fh, req)
+
+            done = False
+            try:
+                while done is False:
+                    status, done = downloader.next_chunk()
+            except Exception as inst:
+                return json.dumps({"error": "Failed in downloading html file. please check fileId again"})
+            fh.close()
         ### download attached files
-        fileIds = googleattachment.replace(" ", "")
-        fileIds = fileIds.split(",")
-        attachFileNames = download(service, fileIds, prefix)
+        # templateID_folder = "1Tnw9ShNslKIwt7awqxQQ7Awva7rMXE3T"
+        if templateID_folder != "":
+            fileIds = get_files_in_folder(service, templateID_folder)
+            attachFileNames = download(service, fileIds, prefix+"/attachments")
 
         ## Define values which are needed to exchange with email text.
         values = {}
@@ -251,22 +303,44 @@ def sendEmail():
         for name in attachFileNames:
             if (os.path.exists(name)):
                 os.remove(name)
-        os.rmdir(prefix)
+        # os.rmdir(prefix+"/attachments")
+        # os.rmdir(prefix)
+        shutil.rmtree(prefix)
         return json.dumps({"success": "sent email to " + Reply_to})
 
 ## Get file list of google drive
 @app.route('/fileList')
 def fileList():
-    # Setup the Drive v3 API
+    # Setup the Drive v2 API
     service = getConnection()
-    # Call the Drive v3 API
-    results = service.files().list(
-        fields="nextPageToken, files(id, name)").execute()
-    items = results.get('files', [])
-    if not items:
-        return "File Not Found"
-    else:
-        return json.dumps({'lists': items})
+
+    result = []
+    page_token = None
+    while True:
+        try:
+            param = {}
+            if page_token:
+                param['pageToken'] = page_token
+            files = service.files().list(**param).execute()
+
+            result.extend(files['items'])
+            page_token = files.get('nextPageToken')
+            if not page_token:
+                break
+        except errors.HttpError as error:
+            print('An error occurred: %s' % error)
+            break
+    return json.dumps({'lists': result})
+
+    #
+    # # Call the Drive v2 API
+    # results = service.files().list(
+    #     fields="nextPageToken, files(id, name)").execute()
+    # items = results.get('files', [])
+    # if not items:
+    #     return "File Not Found"
+    # else:
+    #     return json.dumps({'lists': items})
 
 @app.route('/restApi', methods=['POST'])
 def uploads():
